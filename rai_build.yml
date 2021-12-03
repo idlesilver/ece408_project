@@ -21,8 +21,11 @@ commands:
       # - /bin/bash -c "time ./m1 1000"
       # - /bin/bash -c "gprof -Q m1 gmon.out"
 
-      # - /bin/bash -c "time ./m2 10000"
+      - /bin/bash -c "time ./m2 10000"
       # - nsys profile --stats=true ./m2 > m2_output
-      - nv-nsight-cu-cli --section '.*' -o analysis_file ./m2
+      # - nv-nsight-cu-cli --section '.*' -o analysis_file ./m2
       # - /bin/bash -c "cuda-memcheck ./m2 100"
       #- /bin/bash -c "./m3"
+
+
+# rai -p ./ --queue rai_amd64_exclusive

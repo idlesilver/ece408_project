@@ -47,17 +47,19 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     int w = (blockIdx.z % W_num) * BLOCK_WIDTH + threadIdx.x;
     int h = (blockIdx.z / W_num) * BLOCK_WIDTH + threadIdx.y;
 
-    if (w < W_out && h < H_out) {
-        // the same inner iteration from m1
-        y4d(b, m, h, w) = 0;
-        for (int c = 0; c < C; ++c) {
-            for (int p = 0; p < K; ++p) {
-                for (int q = 0; q < K; ++q) {
-                    y4d(b, m, h, w) += x4d(b, c, h+p, w+q) * k4d(m, c, p, q);
-                }
+
+    int c,p,q;
+    float res = 0.0f;
+    if (w >= W_out || h >= H_out)return;
+    // the same inner iteration from m1
+    for (c = 0; c < C; ++c) {
+        for (p = 0; p < K; ++p) {
+            for (q = 0; q < K; ++q) {
+                res += x4d(b, c, h+p, w+q) * k4d(m, c, p, q);
             }
         }
     }
+    y4d(b, m, h, w) = res;
 
 
 #undef y4d
