@@ -1,8 +1,9 @@
 #include <cmath>
 #include <iostream>
+#include <cuda_fp16.h>
 #include "gpu-new-forward.h"
 
-
+#define MODEL_NAME "Fixed point"
 #define BLOCK_WIDTH 16
 
 __global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
@@ -39,7 +40,6 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
 #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     // Insert your GPU convolution kernel code here
-   
     int W_num = ceil(W_out / (BLOCK_WIDTH * 1.0));
     int H_num = ceil(H_out / (BLOCK_WIDTH * 1.0));
     
@@ -47,19 +47,19 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     int w = (blockIdx.z % W_num) * BLOCK_WIDTH + threadIdx.x;
     int h = (blockIdx.z / W_num) * BLOCK_WIDTH + threadIdx.y;
 
-
-    int c,p,q;
-    float res = 0.0f;
+    // float r = 0;
+    __half res = 0;
     if (w >= W_out || h >= H_out)return;
     // the same inner iteration from m1
-    for (c = 0; c < C; ++c) {
-        for (p = 0; p < K; ++p) {
-            for (q = 0; q < K; ++q) {
-                res += x4d(b, c, h+p, w+q) * k4d(m, c, p, q);
+    for (int c = 0; c < C; c++) {
+        for (int p = 0; p < K; p++) {
+            for (int q = 0; q < K; q++) {
+                res = __hadd(res, __hmul(__float2half(x4d(b,c,h+p,w+q)), __float2half(k4d(m,c,p,q))));
             }
         }
     }
-    y4d(b, m, h, w) = res;
+    y4d(b, m, h ,w) = __half2float(res);
+
 
 
 #undef y4d
@@ -73,6 +73,8 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_y, const f
     // Allocate memory and copy over the relevant data structures to the GPU
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
+    
+    std::cout<<"model name: "<< MODEL_NAME <<std::endl;
 
     int y_size = B*M*H_out*W_out*sizeof(float);     // y is the output
     int x_size = B*C*H*W*sizeof(float);             // x is the input

@@ -1,22 +1,12 @@
-/* optimization 1:
- * Tiled shared memory convolution (2 points)
- */
 #include <cmath>
 #include <iostream>
 #include "gpu-new-forward.h"
 
-
-#define BLOCK_WIDTH 16
-/* Set a tile width other than block width for distinguishing 
- * between two concept, althought the value is the same.
- */
-#define TILE_WIDTH 16
+#define MODEL_NAME "baseline"
+#define BLOCK_WIDTH 32
 
 __global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
     /*
     Modify this function to implement the forward pass described in Chapter 16.
     We have added an additional dimension to the tensors to support an entire mini-batch
@@ -44,67 +34,30 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     // float a = y4d(0,0,0,0)
     // y4d(0,0,0,0) = a
 
+#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     // Insert your GPU convolution kernel code here
    
-    int W_num = ceil(W_out * 1.0 / (TILE_WIDTH * 1.0));
-    int H_num = ceil(H_out * 1.0 / (TILE_WIDTH * 1.0));
-    int x_out_width = TILE_WIDTH + K - 1;
+    int W_num = ceil(W_out / (BLOCK_WIDTH * 1.0));
+    int H_num = ceil(H_out / (BLOCK_WIDTH * 1.0));
     
-    // FIXME: x_out_width cannot used as const!!!
-    // extern __shared__ float shareX[x_out_width*x_out_width];
-    // extern __shared__ float shareW[];
-
-    // use one place instead
-    extern __shared__ float share[];
-
-    float* shareX = &share[0];
-    float* shareW = &share[x_out_width*x_out_width];
-
-    int b = blockIdx.x;
-    int m = blockIdx.y;
-    int h = (blockIdx.z / W_num) * TILE_WIDTH + threadIdx.y;
-    int w = (blockIdx.z % W_num) * TILE_WIDTH + threadIdx.x;
-    int h_start=(blockIdx.z / W_num)*TILE_WIDTH; 
-    int w_start=(blockIdx.z % W_num)*TILE_WIDTH; 
+    int b = blockIdx.x, m = blockIdx.y;
+    int w = (blockIdx.z % W_num) * BLOCK_WIDTH + threadIdx.x;
+    int h = (blockIdx.z / W_num) * BLOCK_WIDTH + threadIdx.y;
 
 
-    // return if thread out of board
-    if (b>=B || m>=M || h>=H_out || w>=W_out)return;
-    
-    int c,p,q,i,j;
+    int c,p,q;
     float res = 0.0f;
+    if (w >= W_out || h >= H_out)return;
+    // the same inner iteration from m1
     for (c = 0; c < C; ++c) {
-        // copy W to shared memory
-        if ((threadIdx.y<K) && (threadIdx.x<K)){
-            shareW[threadIdx.y*K+threadIdx.x]=k4d(m,c,threadIdx.y,threadIdx.x);
-        }
-        __syncthreads();
-
-        // copy X to shared memory
-        for (i=h; i<h_start+x_out_width; i+=TILE_WIDTH){
-		    for (j=w; j<w_start+x_out_width; j+=TILE_WIDTH){
-			    if (i<H && j<W){
-				    shareX[(i-h_start)*x_out_width+(j-w_start)]=x4d(b,c,i,j);
-			    }
-			    else{
-				    shareX[(i-h_start)*x_out_width+(j-w_start)]=0;
-			    }
-		    }
-	    }
-        __syncthreads();
-
-        // do the conv
         for (p = 0; p < K; ++p) {
             for (q = 0; q < K; ++q) {
                 res += x4d(b, c, h+p, w+q) * k4d(m, c, p, q);
-                if(((threadIdx.y+p) < x_out_width) && ((threadIdx.x+q) < x_out_width)){
-				    res+=shareX[(threadIdx.y+p)*x_out_width + (threadIdx.x+q)] * shareW[p*K+q];
-			    }
             }
         }
-        __syncthreads();
-    
     }
     y4d(b, m, h, w) = res;
 
@@ -153,8 +106,11 @@ __host__ void GPUInterface::conv_forward_gpu(float *device_y, const float *devic
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
 
-    dim3 dimGrid(B, M, ceil(W_out / (TILE_WIDTH * 1.0)) * ceil(H_out / (TILE_WIDTH * 1.0)));
-    dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
+    std::cout<<"model name: "<< MODEL_NAME <<std::endl;
+    std::cout<<"value of B:"<<B<<", value of M:"<<M<<", value of C:"<<C<<", value of H:"<<H<<", value of W:"<<W<<", value of K:"<<K <<std::endl;
+
+    dim3 dimGrid(B, M, ceil(W_out / (BLOCK_WIDTH * 1.0)) * ceil(H_out / (BLOCK_WIDTH * 1.0)));
+    dim3 dimBlock(BLOCK_WIDTH, BLOCK_WIDTH, 1);
 
     conv_forward_kernel<<<dimGrid, dimBlock>>>(device_y, device_x, device_k, B, M, C, H, W, K);
 
