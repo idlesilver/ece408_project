@@ -3,8 +3,13 @@
 #include <cuda_fp16.h>
 #include "gpu-new-forward.h"
 
-#define MODEL_NAME "Fixed point"
-#define BLOCK_WIDTH 16
+
+#define MODEL_NAME "best"
+#define TILE_WIDTH 16
+#define BLOCK_STREAM_SIZE 16
+#define STREAM_NUM 10
+
+cudaStream_t stream[STREAM_NUM];
 
 __global__ void conv_forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
@@ -40,14 +45,15 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
 #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
     // Insert your GPU convolution kernel code here
-    int W_num = ceil(W_out / (BLOCK_WIDTH * 1.0));
-    int H_num = ceil(H_out / (BLOCK_WIDTH * 1.0));
+   
+    int W_num = ceil(W_out / (TILE_WIDTH * 1.0));
+    int H_num = ceil(H_out / (TILE_WIDTH * 1.0));
     
     int b = blockIdx.x, m = blockIdx.y;
-    int w = (blockIdx.z % W_num) * BLOCK_WIDTH + threadIdx.x;
-    int h = (blockIdx.z / W_num) * BLOCK_WIDTH + threadIdx.y;
+    int w = (blockIdx.z % W_num) * TILE_WIDTH + threadIdx.x;
+    int h = (blockIdx.z / W_num) * TILE_WIDTH + threadIdx.y;
 
-    // float r = 0;
+
     __half res = 0;
     if (w >= W_out || h >= H_out)return;
     // the same inner iteration from m1
@@ -61,95 +67,82 @@ __global__ void conv_forward_kernel(float *y, const float *x, const float *k, co
     y4d(b, m, h ,w) = __half2float(res);
 
 
-
 #undef y4d
 #undef x4d
 #undef k4d
 }
 
-	
+
+/* cudaStream_t stream is not in param, so all is written in here */
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_y, const float *host_x, const float *host_k, float **device_y_ptr, float **device_x_ptr, float **device_k_ptr, const int B, const int M, const int C, const int H, const int W, const int K)
 {
+
     // Allocate memory and copy over the relevant data structures to the GPU
     const int H_out = H - K + 1;
     const int W_out = W - K + 1;
-    
+
     std::cout<<"model name: "<< MODEL_NAME <<std::endl;
 
-    int y_size = B*M*H_out*W_out*sizeof(float);     // y is the output
     int x_size = B*C*H*W*sizeof(float);             // x is the input
+    int y_size = B*M*H_out*W_out*sizeof(float);     // y is the output
     int k_size = M*C*K*K*sizeof(float);             // k is the kernel, M kernels in total
+
+    int x_stream_size = B*C*H*W/STREAM_NUM;             // x is the input
+    int y_stream_size = B*M*H_out*W_out/STREAM_NUM;     // y is the output
+    int k_stream_size = M*C*K*K;             // k is the kernel, M kernels in total
 
     cudaMalloc((void**) device_y_ptr, y_size);
     cudaMalloc((void**) device_x_ptr, x_size);
     cudaMalloc((void**) device_k_ptr, k_size);
 
-    cudaMemcpy(*device_y_ptr, host_y, y_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(*device_x_ptr, host_x, x_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(*device_k_ptr, host_k, k_size, cudaMemcpyHostToDevice);
-    
+
+    for (int i = 0; i < STREAM_NUM; ++i) {
+        cudaStreamCreate(&stream[i]);
+    }
+    cudaMemcpyAsync(*device_k_ptr, host_k, k_stream_size * sizeof(float), cudaMemcpyHostToDevice, stream[0]);
+    for (int i = 0; i < STREAM_NUM; ++i) {
+        cudaMemcpyAsync((*device_x_ptr) + i*x_stream_size, host_x + i*x_stream_size, x_stream_size * sizeof(float), cudaMemcpyHostToDevice, stream[i]);
+    }
+
+    dim3 dimGrid( B/STREAM_NUM, M , ceil(H_out*1.0/BLOCK_STREAM_SIZE)*ceil(W_out*1.0/BLOCK_STREAM_SIZE) );
+    dim3 dimBlock(BLOCK_STREAM_SIZE, BLOCK_STREAM_SIZE, 1);
+
+    for (int i = 0; i < STREAM_NUM; ++i) {
+        conv_forward_kernel<<<dimGrid, dimBlock, 0, stream[i]>>>( (*device_y_ptr) + i*y_stream_size, (*device_x_ptr) + i*x_stream_size, *device_k_ptr, B, M, C, H, W, K);
+    }
+    for (int i = 0; i < STREAM_NUM; ++i) {
+        cudaMemcpyAsync((void*)(host_y + i*y_stream_size), (void*)((*device_y_ptr) + i*y_stream_size) , y_stream_size * sizeof(float), cudaMemcpyDeviceToHost, stream[i]);
+    }
+    cudaDeviceSynchronize();
+    for (int i = 0; i < STREAM_NUM; ++i) {
+      cudaStreamDestroy(stream[i]);
+    }
+    // We pass double pointers for you to initialize the relevant device pointers,
+    //  which are passed to the other two functions.
+    cudaFree(*device_x_ptr);
+    cudaFree(*device_y_ptr);
+    cudaFree(*device_k_ptr);
+
     // We pass double pointers for you to initialize the relevant device pointers,
     //  which are passed to the other two functions.
 
     // Useful snippet for error checking
-    // cudaError_t error = cudaGetLastError();
-    // if(error != cudaSuccess)
-    // {
-    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-    //     exit(-1);
-    // }
-
+    cudaError_t error = cudaGetLastError();
+    if(error != cudaSuccess)
+    {
+        std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
+        exit(-1);
+    }
 }
-
 
 __host__ void GPUInterface::conv_forward_gpu(float *device_y, const float *device_x, const float *device_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-    // Set the kernel dimensions and call the kernel
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-
-    dim3 dimGrid(B, M, ceil(W_out / (BLOCK_WIDTH * 1.0)) * ceil(H_out / (BLOCK_WIDTH * 1.0)));
-    dim3 dimBlock(BLOCK_WIDTH, BLOCK_WIDTH, 1);
-
-    conv_forward_kernel<<<dimGrid, dimBlock>>>(device_y, device_x, device_k, B, M, C, H, W, K);
-
-    cudaDeviceSynchronize();
-
-    // Useful snippet for error checking
-    // cudaError_t error = cudaGetLastError();
-    // if(error != cudaSuccess)
-    // {
-    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-    //     exit(-1);
-    // }
+    ;
 }
-
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float *host_y, float *device_y, float *device_x, float *device_k, const int B, const int M, const int C, const int H, const int W, const int K)
 {
-    // Copy the output back to host
-    const int H_out = H - K + 1;
-    const int W_out = W - K + 1;
-
-    int y_size = B*M*H_out*W_out*sizeof(float);     // y is the output
-    int x_size = B*C*H*W*sizeof(float);             // x is the input
-    int k_size = M*C*K*K*sizeof(float);             // k is the kernel, M kernels in total
-    
-    cudaMemcpy(host_y, device_y, y_size, cudaMemcpyDeviceToHost);
-
-    // Free device memory
-    cudaFree(device_y);
-    cudaFree(device_x);
-    cudaFree(device_k);
-
-    // Useful snippet for error checking
-    // cudaError_t error = cudaGetLastError();
-    // if(error != cudaSuccess)
-    // {
-    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-    //     exit(-1);
-    // }
-
+    ;
 }
 
 
